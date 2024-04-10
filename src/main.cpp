@@ -291,26 +291,89 @@ private:
 	int sock;
 };
 
-using ICMPPacketType = ICMPPacket<8>;
+constexpr std::size_t PacketDataSize = 8;
 
-struct HEADER
+using ICMPPacketType = ICMPPacket<PacketDataSize>;
+
+struct icmp_echo_reply
+{
+	std::uint16_t id;
+	std::uint16_t seq;
+
+	std::byte data[PacketDataSize];
+};
+
+struct icmp_ttl_with_options
+{
+	std::byte unused[4];
+	ip ip_header;
+	std::byte options[4];
+	std::byte data[8];
+};
+
+struct icmp_ttl_without_options
+{
+	std::byte unused[4];
+	ip ip_header;
+	std::byte data[8];
+};
+
+struct icmp_responses
 {
 	std::uint8_t type;
 	std::uint8_t code;
 	std::uint16_t checksum;
 
-	std::uint32_t unused;
-
-	ip ip_header;
-
-	std::uint64_t data;
+	union
+	{
+		icmp_echo_reply echo_reply;
+		icmp_ttl_with_options ttl_with_options;
+		icmp_ttl_without_options ttl_without_options;
+	} responses;
 };
 
+/*struct header_with_options
+{
+	std::byte options[4];
+	icmp_responses icmp;
+};*/
+
+struct HEADER
+{
+	ip ip_header;
+
+	union
+	{
+		union
+		{
+			std::byte options[4];
+			icmp_responses icmp;
+		} header_with_opts;
+
+		icmp_responses icmp;
+	} data;
+
+
+	/*std::uint32_t ip_header_top_options;
+
+	std::uint8_t type;
+	std::uint8_t code;
+	std::uint16_t checksum;
+
+	std::uint16_t id;
+	std::uint16_t seq;
+	//std::uint32_t unused;
+
+	ip ip_header_post;
+	std::uint32_t ip_header_post_options;
+
+	std::uint64_t data;*/
+};
 
 int main(int argc, char **argv)
 {
 	const int tries_per_hop = 3;
-	auto host_opt = Host::ResolveHost("www.bsuir.by",
+	auto host_opt = Host::ResolveHost("www.google.com",
 									  AF_INET,
 									  SOCK_RAW,
 									  IPPROTO_ICMP,
@@ -360,12 +423,12 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	int ip_hdr_res = receiver.SetIpHeaderIncludance();
+	/*int ip_hdr_res = receiver.SetIpHeaderIncludance();
 	if(ip_hdr_res < 0)
 	{
 		std::cout<<strerror(errno)<<std::endl;
 		return EXIT_FAILURE;
-	}
+	}*/
 
 	icmphdr h;
 
@@ -381,7 +444,7 @@ int main(int argc, char **argv)
 	hdr.code = 0;
 	hdr.un.echo.id = htons(12345);
 	hdr.un.echo.sequence = htons(12345);
-	ICMPPacketType packet(hdr, 8);
+	ICMPPacketType packet(hdr, 2028);
 
 	while(target_hops <= max_hops)
 	{
@@ -423,6 +486,51 @@ int main(int argc, char **argv)
 			{
 				std::cout<<strerror(errno)<<std::endl;
 				continue;
+			}
+
+
+
+
+			if(header.ip_header.ip_hl > 5)//with options
+			{
+				std::cout<<"Header with options!"<<std::endl;
+				if(header.data.header_with_opts.icmp.type == ICMP_ECHOREPLY)
+				{
+					std::cout<<"ICMP_ECHOREPLY!"<<std::endl;
+					std::cout<<"Id: "<<ntohs(header.data.header_with_opts.icmp.responses.echo_reply.id)<<std::endl;
+					std::cout<<"Seq: "<<ntohs(header.data.header_with_opts.icmp.responses.echo_reply.seq)<<std::endl;
+				}
+				else if(header.data.header_with_opts.icmp.type == ICMP_TIME_EXCEEDED)
+				{
+					std::cout<<"ICMP_TIME_EXCEEDED!"<<std::endl;
+				}
+				else
+				{
+					std::cout<<"ICMP_UNDEFINED!"<<std::endl;
+				}
+			}
+			else
+			{
+				std::cout<<"Header without options!"<<std::endl;
+				if(header.data.icmp.type == ICMP_ECHOREPLY)
+				{
+					std::cout<<"ICMP_ECHOREPLY!"<<std::endl;
+					std::cout<<"Id: "<<header.data.icmp.responses.echo_reply.id<<std::endl;
+					std::cout<<"Seq: "<<header.data.icmp.responses.echo_reply.seq<<std::endl;
+					std::cout<<"Data: "<<*reinterpret_cast<std::uint64_t*>(header.data.icmp.responses.echo_reply.data)<<std::endl;
+				}
+				else if(header.data.icmp.type == ICMP_TIME_EXCEEDED)
+				{
+					std::cout<<"ICMP_TIME_EXCEEDED!"<<std::endl;
+					bool same = !std::memcmp(header.data.icmp.responses.ttl_without_options.data,
+											 &packet.header,
+											 64);
+					std::cout<<std::boolalpha<<same<<std::endl;
+				}
+				else
+				{
+					std::cout<<"ICMP_UNDEFINED!"<<std::endl;
+				}
 			}
 
 			char *ip = inet_ntoa(reinterpret_cast<sockaddr_in *>(&recv_addr)->sin_addr);
@@ -485,6 +593,9 @@ int main(int argc, char **argv)
 
 			std::cout<<std::endl;
 		}*/
+
+		//if(header.type == ICMP_EXC_TTL)//???
+		//	break;
 
 		if(host.IsSame(&recv_addr, recv_addr_len))
 			break;
