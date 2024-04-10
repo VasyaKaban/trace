@@ -15,6 +15,7 @@
 #include <optional>
 #include <utility>
 #include <cassert>
+#include <chrono>
 
 template<std::size_t N>
 struct ICMPPacket
@@ -51,7 +52,7 @@ struct ICMPPacket
 		return *this;
 	}
 
-	static ushort checksum(void *b, int len)
+	/*static ushort checksum(void *b, int len)
 	{
 		ushort *buf = reinterpret_cast<ushort *>(b);
 		uint sum=0;
@@ -67,7 +68,7 @@ struct ICMPPacket
 		sum += (sum >> 16);
 		result = ~sum;
 		return result;
-	}
+	}*/
 
 	void RecalculateChecksum() noexcept
 	{
@@ -83,7 +84,6 @@ struct ICMPPacket
 			sum = (sum & 0xFFFF) + carry;
 		}
 
-		auto csum = checksum(this, sizeof(*this));
 		header.checksum = ~sum;
 		//header.checksum = htons((~sum) & 0xFFFF);
 
@@ -353,6 +353,58 @@ struct HEADER
 		icmp_responses icmp;
 	} data;
 
+	template<std::size_t N>
+	bool SamePacket(const ICMPPacket<N> &pack) noexcept
+	{
+		if(ip_header.ip_hl > 5)//with options
+		{
+			if(data.header_with_opts.icmp.type == 8)//ECHO_REPLY
+			{
+				return
+					data.header_with_opts.icmp.responses.echo_reply.id == pack.header.un.echo.id &&
+					data.header_with_opts.icmp.responses.echo_reply.seq == pack.header.un.echo.sequence;
+			}
+			else if(data.header_with_opts.icmp.type == 11)//TTL_TIMEOUT
+			{
+				return !std::memcmp(&data.header_with_opts.icmp.responses.ttl_with_options.data,
+									&pack,
+									8);
+			}
+			else
+			{
+				std::cout<<"Unexpected icmp type: "<<data.header_with_opts.icmp.type<<std::endl;
+				return false;
+			}
+		}
+		else//without options
+		{
+			if(data.icmp.type == 8)//ECHO_REPLY
+			{
+				return
+					data.icmp.responses.echo_reply.id == pack.header.un.echo.id &&
+					data.icmp.responses.echo_reply.seq == pack.header.un.echo.sequence;
+			}
+			else if(data.icmp.type == 11)//TTL_TIMEOUT
+			{
+				return !std::memcmp(&data.icmp.responses.ttl_without_options.data,
+									&pack,
+									8);
+			}
+			else
+			{
+				std::cout<<"Unexpected icmp type: "<<data.icmp.type<<std::endl;
+				return false;
+			}
+		}
+	}
+
+	bool SameType(std::uint8_t type) const noexcept
+	{
+		if(ip_header.ip_hl > 5)
+			return data.header_with_opts.icmp.type == type;
+
+		return data.icmp.type == type;
+	}
 
 	/*std::uint32_t ip_header_top_options;
 
@@ -370,9 +422,32 @@ struct HEADER
 	std::uint64_t data;*/
 };
 
+struct ReadResult
+{
+	sockaddr address;
+	socklen_t address_len;
+	std::chrono::milliseconds read_time;
+
+	ReadResult() = default;
+
+	ReadResult(const sockaddr *_address,
+			   socklen_t _address_len,
+			   std::chrono::milliseconds _read_time) noexcept
+		: address_len(_address_len),
+		  read_time(_read_time)
+	{
+		std::memcpy(&address, _address, _address_len);
+	}
+
+	ReadResult(const ReadResult &) = default;
+	ReadResult(ReadResult &&) = default;
+	ReadResult & operator=(const ReadResult &) = default;
+	ReadResult & operator=(ReadResult &&) = default;
+};
+
 int main(int argc, char **argv)
 {
-	const int tries_per_hop = 3;
+	int tries_per_hop = 3;
 	auto host_opt = Host::ResolveHost("www.google.com",
 									  AF_INET,
 									  SOCK_RAW,
@@ -446,6 +521,9 @@ int main(int argc, char **argv)
 	hdr.un.echo.sequence = htons(12345);
 	ICMPPacketType packet(hdr, 2028);
 
+	std::vector<ReadResult> read_results;
+	read_results.resize(tries_per_hop);
+
 	while(target_hops <= max_hops)
 	{
 		int ttl_set_res = sender.SetTTL(target_hops);
@@ -455,8 +533,9 @@ int main(int argc, char **argv)
 			return EXIT_FAILURE;
 		}
 
-		std::string recognized_ip;
 		int i = 0;
+		std::fill_n(read_results.begin(), tries_per_hop, ReadResult{});
+		//std::array<ReadResult, tries_per_hop> read_results = {};
 		for(; i < tries_per_hop; i++)
 		{
 			packet.header.un.echo.sequence = htons((ntohs(packet.header.un.echo.sequence) + 1));
@@ -475,6 +554,8 @@ int main(int argc, char **argv)
 				return EXIT_FAILURE;
 			}
 
+			auto read_time_start  = std::chrono::system_clock::now();
+
 			int read_res = recvfrom(receiver.GetFD(),
 									&header,
 									sizeof(header),
@@ -488,10 +569,27 @@ int main(int argc, char **argv)
 				continue;
 			}
 
+			auto read_delta =
+				std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() -
+																					read_time_start);
 
+			//if(!header.SamePacket(packet))
+			//	continue;
 
+			if(!(header.SameType(ICMP_TIME_EXCEEDED) || header.SameType(ICMP_ECHOREPLY)))
+				continue;
 
-			if(header.ip_header.ip_hl > 5)//with options
+			read_results[i] = ReadResult(&recv_addr, recv_addr_len, read_delta);
+
+			//constexpr std::uint16_t d = 0x36C6;
+			//constexpr std::uint16_t invd = ~d;
+			//constexpr std::uint16_t p = 0x81AB;
+			//constexpr std::uint16_t invp = ~p;
+
+			//data -> 0xc636
+			//pack -> 0xab81
+
+			/*if(header.ip_header.ip_hl > 5)//with options
 			{
 				std::cout<<"Header with options!"<<std::endl;
 				if(header.data.header_with_opts.icmp.type == ICMP_ECHOREPLY)
@@ -524,26 +622,67 @@ int main(int argc, char **argv)
 					std::cout<<"ICMP_TIME_EXCEEDED!"<<std::endl;
 					bool same = !std::memcmp(header.data.icmp.responses.ttl_without_options.data,
 											 &packet.header,
-											 64);
+											 8);
 					std::cout<<std::boolalpha<<same<<std::endl;
 				}
 				else
 				{
 					std::cout<<"ICMP_UNDEFINED!"<<std::endl;
 				}
-			}
-
-			char *ip = inet_ntoa(reinterpret_cast<sockaddr_in *>(&recv_addr)->sin_addr);
-			recognized_ip = ip;
-			break;
+			}*/
 		}
 
 		std::cout<<"Hop: "<<target_hops<<"\t";
 
-		if(i == 3)
-			std::cout<<"* * *"<<std::endl;
-		else
+		//if(i == 3)
+		//	std::cout<<"* * *"<<std::endl;
+		//else
+
+
+		char *ip = nullptr;
+		std::optional<Host::HostName> remote_host_opt;
+		for(const auto &read_res : read_results)
 		{
+			if(ip == nullptr)
+				ip = inet_ntoa(reinterpret_cast<const sockaddr_in *>(&read_res.address)->sin_addr);
+
+			auto host_name_opt = Host::ResolveAddress(&read_res.address, read_res.address_len);
+			if(!remote_host_opt && host_name_opt)
+				remote_host_opt = host_name_opt;
+		}
+
+		if(ip)
+			std::cout<<"ip: "<<ip<<"\t";
+		else
+			std::cout<<"ip: UNRESOLVED_IP\t";
+
+		if(remote_host_opt)
+		{
+			if(!remote_host_opt->IsHostEmpty())
+				std::cout<<"host: "<<remote_host_opt->host<<"\t";
+			else
+				std::cout<<"host: UNRESOLVED_HOST\t";
+
+			if(!remote_host_opt->IsServerEmpty())
+				std::cout<<"server: "<<remote_host_opt->server<<"\t";
+			else
+				std::cout<<"server: UNRESOLVED_SERVER\t";
+		}
+		else
+			std::cout<<"host: UNRESOLVED_HOST\tserver: UNRESOLVED_SERVER\t";
+
+		std::cout<<"time: ";
+		for(const auto &read_res : read_results)
+		{
+			if(read_res.read_time != std::chrono::milliseconds(0))
+				std::cout<<read_res.read_time<<" ";
+			else
+				std::cout<<"* ";
+		}
+		std::cout<<std::endl;
+
+
+		/*{
 			if(!recognized_ip.empty())
 				std::cout<<"ip: "<<recognized_ip<<"\t";
 			else
@@ -565,14 +704,19 @@ int main(int argc, char **argv)
 			else
 				std::cout<<"host: UNRESOLVED_HOST\tserver: UNRESOLVED_SERVER\t";
 
+			std::cout<<"time: ";
+			for(const auto time : tries_read_time)
+				std::cout<<time<<" ";
+			std::cout<<"\t";
+
 			if(i != 0)
 			{
 				for(int j = 0; j < i; j++)
 					std::cout<<"* ";
 			}
-		}
 
-		std::cout<<std::endl;
+			std::cout<<std::endl;
+		}*/
 
 		/*if(recognized_ip.empty())
 			std::cout<<"Hop: "<<target_hops<<"\t* * *"<<std::endl;
