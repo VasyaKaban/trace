@@ -16,6 +16,8 @@
 #include <utility>
 #include <cassert>
 #include <chrono>
+#include <fstream>
+#include <filesystem>
 
 template<std::size_t N>
 struct ICMPPacket
@@ -460,13 +462,24 @@ struct TraceConfig
 	std::string host;
 	int hops = 30;
 	int samples = 3;
+	std::variant<std::monostate, std::reference_wrapper<std::ostream>, std::ofstream> output_stream;
 
-	TraceConfig() = default;
+	TraceConfig()
+		: output_stream(std::ref(std::cout)) {}
 
 	constexpr TraceConfig(std::string_view _host, int _hops, int _samples) noexcept
 		: host(_host),
 		  hops(_hops),
 		  samples(_samples) {}
+
+	constexpr TraceConfig(std::string_view _host,
+						  int _hops,
+						  int _samples,
+						  std::ofstream &&_output_stream) noexcept
+		: host(_host),
+		  hops(_hops),
+		  samples(_samples),
+		  output_stream(std::move(_output_stream)) {}
 
 	static TraceConfig Create(int argc, char **argv)
 	{
@@ -474,6 +487,7 @@ struct TraceConfig
 			PrintHelpAndExit();
 
 		TraceConfig config;
+		config.output_stream = std::ref(std::cout);
 		for(int i = 1; i < argc; i++)
 		{
 			std::string_view argv_view(argv[i], std::strlen(argv[i]));
@@ -482,23 +496,18 @@ struct TraceConfig
 				PrintHelpAndExit();
 			}
 			else if(argv_view.starts_with("--host="))
-			{
-				auto host_value = SplitArgumentWithAssignment(argv_view);
-				if(host_value.empty())
-				{
-					std::cout<<"No passed host!"<<std::endl;
-					exit(EXIT_FAILURE);
-				}
-
-				config.host = host_value;
-			}
+				config.host = ParseString(argv_view, "host");
 			else if(argv_view.starts_with("--hops="))
-			{
 				config.hops = ParseNonZeroInt(argv_view, "hops");
-			}
 			else if(argv_view.starts_with("--samples="))
-			{
 				config.samples = ParseNonZeroInt(argv_view, "samples");
+			else if(argv_view.starts_with("--samples="))
+				config.samples = ParseNonZeroInt(argv_view, "samples");
+			else if(argv_view.starts_with("--out_file="))
+			{
+				auto ofs_opt = OpenStream(ParseString(argv_view, "output file path"));
+				if(ofs_opt)
+					config.output_stream = std::move(ofs_opt.value());
 			}
 			else
 			{
@@ -508,6 +517,15 @@ struct TraceConfig
 		}
 
 		return config;
+	}
+
+	std::ostream & GetOutputStream() noexcept
+	{
+		assert(!std::holds_alternative<std::monostate>(output_stream));
+		if(std::holds_alternative<std::ofstream>(output_stream))
+			return std::get<std::ofstream>(output_stream);
+		else
+			return std::get<std::reference_wrapper<std::ostream>>(output_stream).get();
 	}
 
 private:
@@ -523,7 +541,22 @@ private:
 					 " Each sample is a send/receive iteration with remote host information collection"
 					 " and timer measurements!"
 					 " This value must be greater than zero\n";
+		std::cout<<"--out_path -> sets the path for an output file."
+					 " By default output will be flushed into the stdout\n";
 		exit(EXIT_SUCCESS);
+	}
+
+	static std::optional<std::ofstream> OpenStream(const std::filesystem::path path) noexcept
+	{
+		std::ofstream ofs;
+		ofs.open(path);
+		if(!ofs.is_open())
+		{
+			std::cout<<"Output stream into the file: "<<path<<" cannot be opened!"<<std::endl;
+			return {};
+		}
+
+		return ofs;
 	}
 
 	static bool FromCharsResultGood(const std::from_chars_result &res, const char *end) noexcept
@@ -559,6 +592,18 @@ private:
 		return value;
 	}
 
+	static std::string_view ParseString(std::string_view arg, const char *arg_name)
+	{
+		auto value = SplitArgumentWithAssignment(arg);
+		if(value.empty())
+		{
+			std::cout<<"No passed "<<arg_name<<"!"<<std::endl;
+			exit(EXIT_FAILURE);
+		}
+
+		return value;
+	}
+
 	static std::string_view SplitArgumentWithAssignment(std::string_view arg) noexcept
 	{
 		auto assignment_pos = arg.find("=");
@@ -578,16 +623,17 @@ int main(int argc, char **argv)
 									  IPPROTO_ICMP,
 									  AI_CANONNAME);
 
+	std::ostream &out = config.GetOutputStream();
 
 	ExitOnBadCondition(host_opt.has_value());
 	Host &host = *host_opt;
-	std::cout<<"Goal host name: "<<host.name<<"\tip: "<<host.GetStringAddress()<<std::endl;
+	out<<"Goal host name: "<<host.name<<"\tip: "<<host.GetStringAddress()<<std::endl;
 
 	Socket sender;
 	int sender_open_res = sender.Open(AF_INET, SOCK_RAW, IPPROTO_ICMP);
 	if(sender_open_res != 0)
 	{
-		std::cout<<strerror(sender_open_res)<<std::endl;
+		out<<strerror(sender_open_res)<<std::endl;
 		return sender_open_res;
 	}
 
@@ -595,7 +641,7 @@ int main(int argc, char **argv)
 	int receiver_open_res = receiver.Open(AF_INET, SOCK_RAW, IPPROTO_ICMP);
 	if(receiver_open_res != 0)
 	{
-		std::cout<<strerror(errno)<<std::endl;
+		out<<strerror(errno)<<std::endl;
 		return errno;
 	}
 
@@ -607,7 +653,7 @@ int main(int argc, char **argv)
 	int bind_res = receiver.Bind(reinterpret_cast<const sockaddr *>(&local), sizeof(local));
 	if(bind_res != 0)
 	{
-		std::cout<<strerror(errno)<<std::endl;
+		out<<strerror(errno)<<std::endl;
 		return errno;
 	}
 
@@ -617,7 +663,7 @@ int main(int argc, char **argv)
 	int recv_timeout_res = receiver.SetReceiveTimeout(timeout);
 	if(recv_timeout_res < 0)
 	{
-		std::cout<<strerror(errno)<<std::endl;
+		out<<strerror(errno)<<std::endl;
 		return EXIT_FAILURE;
 	}
 
@@ -652,7 +698,7 @@ int main(int argc, char **argv)
 		int ttl_set_res = sender.SetTTL(target_hops);
 		if(ttl_set_res < 0)
 		{
-			std::cout<<strerror(errno)<<std::endl;
+			out<<strerror(errno)<<std::endl;
 			return EXIT_FAILURE;
 		}
 
@@ -673,7 +719,7 @@ int main(int argc, char **argv)
 								  host.address_len);
 			if(send_res < 0)
 			{
-				std::cout<<strerror(errno)<<std::endl;
+				out<<strerror(errno)<<std::endl;
 				return EXIT_FAILURE;
 			}
 
@@ -705,7 +751,7 @@ int main(int argc, char **argv)
 			read_results[i] = ReadResult(&recv_addr, recv_addr_len, read_delta);
 		}
 
-		std::cout<<"Hop: "<<target_hops<<"\t";
+		out<<"Hop: "<<target_hops<<"\t";
 
 		char *ip = nullptr;
 		std::optional<Host::HostName> remote_host_opt;
@@ -723,34 +769,34 @@ int main(int argc, char **argv)
 		}
 
 		if(ip)
-			std::cout<<"ip: "<<ip<<"\t";
+			out<<"ip: "<<ip<<"\t";
 		else
-			std::cout<<"ip: UNRESOLVED_IP\t";
+			out<<"ip: UNRESOLVED_IP\t";
 
 		if(remote_host_opt)
 		{
 			if(!remote_host_opt->IsHostEmpty())
-				std::cout<<"host: "<<remote_host_opt->host<<"\t";
+				out<<"host: "<<remote_host_opt->host<<"\t";
 			else
-				std::cout<<"host: UNRESOLVED_HOST\t";
+				out<<"host: UNRESOLVED_HOST\t";
 
 			if(!remote_host_opt->IsServerEmpty())
-				std::cout<<"server: "<<remote_host_opt->server<<"\t";
+				out<<"server: "<<remote_host_opt->server<<"\t";
 			else
-				std::cout<<"server: UNRESOLVED_SERVER\t";
+				out<<"server: UNRESOLVED_SERVER\t";
 		}
 		else
-			std::cout<<"host: UNRESOLVED_HOST\tserver: UNRESOLVED_SERVER\t";
+			out<<"host: UNRESOLVED_HOST\tserver: UNRESOLVED_SERVER\t";
 
-		std::cout<<"time: ";
+		out<<"time: ";
 		for(const auto &read_res : read_results)
 		{
 			if(read_res.read_time != std::chrono::milliseconds(0))
-				std::cout<<read_res.read_time<<" ";
+				out<<read_res.read_time<<" ";
 			else
-				std::cout<<"* ";
+				out<<"* ";
 		}
-		std::cout<<std::endl;
+		out<<std::endl;
 
 
 		/*{
