@@ -116,7 +116,7 @@ struct Host
 				int hint_family,
 				int hint_socktype,
 				int hint_proto,
-				int hint_flags) noexcept
+				int hint_flags)
 	{
 		addrinfo *addrinfo_result;
 		addrinfo hints;
@@ -138,6 +138,16 @@ struct Host
 
 		freeaddrinfo(addrinfo_result);
 		return out_host;
+	}
+
+	static std::optional<Host>
+	ResolveHost(const std::string &host,
+				int hint_family,
+				int hint_socktype,
+				int hint_proto,
+				int hint_flags)
+	{
+		return ResolveHost(host.data(), hint_family, hint_socktype, hint_proto, hint_flags);
 	}
 
 	struct HostName
@@ -445,10 +455,124 @@ struct ReadResult
 	ReadResult & operator=(ReadResult &&) = default;
 };
 
+struct TraceConfig
+{
+	std::string host;
+	int hops = 30;
+	int samples = 3;
+
+	TraceConfig() = default;
+
+	constexpr TraceConfig(std::string_view _host, int _hops, int _samples) noexcept
+		: host(_host),
+		  hops(_hops),
+		  samples(_samples) {}
+
+	static TraceConfig Create(int argc, char **argv)
+	{
+		if(argc == 1)
+			PrintHelpAndExit();
+
+		TraceConfig config;
+		for(int i = 1; i < argc; i++)
+		{
+			std::string_view argv_view(argv[i], std::strlen(argv[i]));
+			if(argv_view == "--help")
+			{
+				PrintHelpAndExit();
+			}
+			else if(argv_view.starts_with("--host="))
+			{
+				auto host_value = SplitArgumentWithAssignment(argv_view);
+				if(host_value.empty())
+				{
+					std::cout<<"No passed host!"<<std::endl;
+					exit(EXIT_FAILURE);
+				}
+
+				config.host = host_value;
+			}
+			else if(argv_view.starts_with("--hops="))
+			{
+				config.hops = ParseNonZeroInt(argv_view, "hops");
+			}
+			else if(argv_view.starts_with("--samples="))
+			{
+				config.samples = ParseNonZeroInt(argv_view, "samples");
+			}
+			else
+			{
+				std::cout<<"Undefined argument: "<<argv_view<<std::endl;
+				exit(EXIT_FAILURE);
+			}
+		}
+
+		return config;
+	}
+
+private:
+	[[noreturn]] static void PrintHelpAndExit()
+	{
+		std::cout<<"usage: trace [--hops=$value(>0)] [--samples=$value(>0)] --host=$host_name"<<"\n";
+		std::cout<<"Flags:\n";
+		std::cout<<"--help -> show usage infromation\n";
+		std::cout<<"--host -> sets the host name which route we want to explore\n";
+		std::cout<<"--hops -> sets the maximum TTL hops for socket."
+					 " This value must be greater then zero\n";
+		std::cout<<"--samples -> sets the maximum samples per hop."
+					 " Each sample is a send/receive iteration with remote host information collection"
+					 " and timer measurements!"
+					 " This value must be greater than zero\n";
+		exit(EXIT_SUCCESS);
+	}
+
+	static bool FromCharsResultGood(const std::from_chars_result &res, const char *end) noexcept
+	{
+		return (res.ec == std::errc(0) && res.ptr == end);
+	}
+
+	static int ParseNonZeroInt(std::string_view arg, const char *arg_name)
+	{
+		auto arg_value = SplitArgumentWithAssignment(arg);
+		if(arg_value.empty())
+		{
+			std::cout<<"No passed "<<arg_name<<"!"<<std::endl;
+			exit(EXIT_FAILURE);
+		}
+
+		int value = 0;
+		auto end = arg_value.data() + arg_value.size();
+		auto res = std::from_chars(arg_value.data(), end, value);
+		int is_good = FromCharsResultGood(res, end);
+		if(!is_good)
+		{
+			std::cout<<"Bad "<<arg_name<<" value!"<<std::endl;
+			exit(EXIT_FAILURE);
+		}
+
+		if(value <= 0)
+		{
+			std::cout<<arg_name<<" value must be greater than zero!"<<std::endl;
+			exit(EXIT_FAILURE);
+		}
+
+		return value;
+	}
+
+	static std::string_view SplitArgumentWithAssignment(std::string_view arg) noexcept
+	{
+		auto assignment_pos = arg.find("=");
+		if(assignment_pos == std::string_view::npos)
+			return {};
+
+		return std::string_view(arg.begin() + assignment_pos + 1, arg.end());
+	}
+};
+
 int main(int argc, char **argv)
 {
-	int tries_per_hop = 3;
-	auto host_opt = Host::ResolveHost("www.google.com",
+	auto config = TraceConfig::Create(argc, argv);
+	auto host_opt = Host::ResolveHost(config.host,
 									  AF_INET,
 									  SOCK_RAW,
 									  IPPROTO_ICMP,
@@ -487,7 +611,6 @@ int main(int argc, char **argv)
 		return errno;
 	}
 
-	int max_hops = 128;
 	int target_hops = 1;
 
 	timeval timeout{.tv_sec = 1, .tv_usec = 0};
@@ -522,9 +645,9 @@ int main(int argc, char **argv)
 	ICMPPacketType packet(hdr, 2028);
 
 	std::vector<ReadResult> read_results;
-	read_results.resize(tries_per_hop);
+	read_results.resize(config.samples);
 
-	while(target_hops <= max_hops)
+	while(target_hops <= config.hops)
 	{
 		int ttl_set_res = sender.SetTTL(target_hops);
 		if(ttl_set_res < 0)
@@ -534,9 +657,9 @@ int main(int argc, char **argv)
 		}
 
 		int i = 0;
-		std::fill_n(read_results.begin(), tries_per_hop, ReadResult{});
+		std::fill_n(read_results.begin(), config.samples, ReadResult{});
 		//std::array<ReadResult, tries_per_hop> read_results = {};
-		for(; i < tries_per_hop; i++)
+		for(; i < config.samples; i++)
 		{
 			packet.header.un.echo.sequence = htons((ntohs(packet.header.un.echo.sequence) + 1));
 			packet.RecalculateChecksum();
@@ -565,7 +688,7 @@ int main(int argc, char **argv)
 
 			if(read_res < 0)
 			{
-				std::cout<<strerror(errno)<<std::endl;
+				//std::cout<<strerror(errno)<<std::endl;
 				continue;
 			}
 
@@ -580,69 +703,17 @@ int main(int argc, char **argv)
 				continue;
 
 			read_results[i] = ReadResult(&recv_addr, recv_addr_len, read_delta);
-
-			//constexpr std::uint16_t d = 0x36C6;
-			//constexpr std::uint16_t invd = ~d;
-			//constexpr std::uint16_t p = 0x81AB;
-			//constexpr std::uint16_t invp = ~p;
-
-			//data -> 0xc636
-			//pack -> 0xab81
-
-			/*if(header.ip_header.ip_hl > 5)//with options
-			{
-				std::cout<<"Header with options!"<<std::endl;
-				if(header.data.header_with_opts.icmp.type == ICMP_ECHOREPLY)
-				{
-					std::cout<<"ICMP_ECHOREPLY!"<<std::endl;
-					std::cout<<"Id: "<<ntohs(header.data.header_with_opts.icmp.responses.echo_reply.id)<<std::endl;
-					std::cout<<"Seq: "<<ntohs(header.data.header_with_opts.icmp.responses.echo_reply.seq)<<std::endl;
-				}
-				else if(header.data.header_with_opts.icmp.type == ICMP_TIME_EXCEEDED)
-				{
-					std::cout<<"ICMP_TIME_EXCEEDED!"<<std::endl;
-				}
-				else
-				{
-					std::cout<<"ICMP_UNDEFINED!"<<std::endl;
-				}
-			}
-			else
-			{
-				std::cout<<"Header without options!"<<std::endl;
-				if(header.data.icmp.type == ICMP_ECHOREPLY)
-				{
-					std::cout<<"ICMP_ECHOREPLY!"<<std::endl;
-					std::cout<<"Id: "<<header.data.icmp.responses.echo_reply.id<<std::endl;
-					std::cout<<"Seq: "<<header.data.icmp.responses.echo_reply.seq<<std::endl;
-					std::cout<<"Data: "<<*reinterpret_cast<std::uint64_t*>(header.data.icmp.responses.echo_reply.data)<<std::endl;
-				}
-				else if(header.data.icmp.type == ICMP_TIME_EXCEEDED)
-				{
-					std::cout<<"ICMP_TIME_EXCEEDED!"<<std::endl;
-					bool same = !std::memcmp(header.data.icmp.responses.ttl_without_options.data,
-											 &packet.header,
-											 8);
-					std::cout<<std::boolalpha<<same<<std::endl;
-				}
-				else
-				{
-					std::cout<<"ICMP_UNDEFINED!"<<std::endl;
-				}
-			}*/
 		}
 
 		std::cout<<"Hop: "<<target_hops<<"\t";
-
-		//if(i == 3)
-		//	std::cout<<"* * *"<<std::endl;
-		//else
-
 
 		char *ip = nullptr;
 		std::optional<Host::HostName> remote_host_opt;
 		for(const auto &read_res : read_results)
 		{
+			if(read_res.address.sa_family == AF_UNSPEC)
+				continue;
+
 			if(ip == nullptr)
 				ip = inet_ntoa(reinterpret_cast<const sockaddr_in *>(&read_res.address)->sin_addr);
 
