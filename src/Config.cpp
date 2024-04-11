@@ -121,7 +121,7 @@ std::ostream & Config::GetOutputStream() noexcept
 
 [[noreturn]] void Config::PrintHelpAndExit()
 {
-	std::cout<<"usage: trace [--hops=$value(>0)] [--samples=$value(>0)] --host=$host_name"<<"\n";
+	std::cout<<"usage: trace [--hops=$value(>0)] [--samples=$value(>0)] --host=$host_name [--timeout=$value(>0)] [--out_file=path]"<<"\n";
 	std::cout<<"Flags:\n";
 	std::cout<<"--help -> show usage infromation\n";
 	std::cout<<"--host -> sets the host name which route we want to explore\n";
@@ -133,7 +133,7 @@ std::ostream & Config::GetOutputStream() noexcept
 				 " This value must be greater than zero\n";
 	std::cout<<"--timeout -> sets timeout in milliseconds for reading."
 				 " This value must be a positive integer. \n";
-	std::cout<<"--out_path -> sets the path for an output file."
+	std::cout<<"--out_file -> sets the path for an output file."
 				 " By default output will be flushed into the stdout\n";
 	exit(EXIT_SUCCESS);
 }
