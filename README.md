@@ -22,3 +22,7 @@
 	**` --samples `** sets the maximum samples per hop. Each sample is a send/receive iteration with remote host information collection and timer measurements! This value must be greater than zero  
 	**` --timeout `** sets timeout in milliseconds for reading. This value must be a positive integer.  
 	**` --out_file `** sets the path for an output file. By default output will be flushed into the stdout  
+
+ ## WARNING!
+ This utility uses ICMP-echo/Time exceeded packets hence you need to execute it with root privileges (via sudo, doas, su or setuid/setgid)
+ 
